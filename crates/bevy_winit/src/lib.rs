@@ -12,7 +12,7 @@ pub use winit_windows::*;
 
 use bevy_app::{App, AppExit, CoreStage, Events, ManualEventReader, Plugin};
 use bevy_ecs::{system::IntoExclusiveSystem, world::World};
-use bevy_math::{ivec2, Vec2};
+use bevy_math::{ivec2, DVec2, Vec2};
 use bevy_utils::tracing::{error, trace, warn};
 use bevy_window::{
     CreateWindow, CursorEntered, CursorLeft, CursorMoved, FileDragAndDrop, ReceivedCharacter,
@@ -303,20 +303,18 @@ pub fn winit_runner_with(mut app: App, mut event_loop: EventLoop<()>) {
                         let mut cursor_moved_events =
                             world.get_resource_mut::<Events<CursorMoved>>().unwrap();
                         let winit_window = winit_windows.get_window(window_id).unwrap();
-                        let position = position.to_logical(winit_window.scale_factor());
-                        let inner_size = winit_window
-                            .inner_size()
-                            .to_logical::<f32>(winit_window.scale_factor());
+                        let inner_size = winit_window.inner_size();
 
                         // move origin to bottom left
-                        let y_position = inner_size.height - position.y;
+                        let y_position = inner_size.height as f64 - position.y;
 
-                        let position = Vec2::new(position.x, y_position);
-                        window.update_cursor_position_from_backend(Some(position));
+                        let physical_position = DVec2::new(position.x, y_position);
+                        window
+                            .update_cursor_physical_position_from_backend(Some(physical_position));
 
                         cursor_moved_events.send(CursorMoved {
                             id: window_id,
-                            position,
+                            position: (physical_position / window.scale_factor()).as_vec2(),
                         });
                     }
                     WindowEvent::CursorEntered { .. } => {
@@ -327,7 +325,7 @@ pub fn winit_runner_with(mut app: App, mut event_loop: EventLoop<()>) {
                     WindowEvent::CursorLeft { .. } => {
                         let mut cursor_left_events =
                             world.get_resource_mut::<Events<CursorLeft>>().unwrap();
-                        window.update_cursor_position_from_backend(None);
+                        window.update_cursor_physical_position_from_backend(None);
                         cursor_left_events.send(CursorLeft { id: window_id });
                     }
                     WindowEvent::MouseInput { state, button, .. } => {
@@ -363,8 +361,7 @@ pub fn winit_runner_with(mut app: App, mut event_loop: EventLoop<()>) {
                         let mut touch_input_events =
                             world.get_resource_mut::<Events<TouchInput>>().unwrap();
 
-                        let winit_window = winit_windows.get_window(window_id).unwrap();
-                        let mut location = touch.location.to_logical(winit_window.scale_factor());
+                        let mut location = touch.location.to_logical(window.scale_factor());
 
                         // On a mobile window, the start is from the top while on PC/Linux/OSX from
                         // bottom
@@ -395,8 +392,20 @@ pub fn winit_runner_with(mut app: App, mut event_loop: EventLoop<()>) {
                             id: window_id,
                             scale_factor,
                         });
-                        #[allow(clippy::float_cmp)]
-                        if window.scale_factor() != scale_factor {
+                        let prior_factor = window.scale_factor();
+                        window.update_scale_factor_from_backend(scale_factor);
+                        let new_factor = window.scale_factor();
+                        if let Some(forced_factor) = window.scale_factor_override() {
+                            // If there is a scale factor override, then force that to be used
+                            // Otherwise, use the OS suggested size
+                            // We have already told the OS about our resize constraints, so
+                            // the new_inner_size should take those into account
+                            *new_inner_size = winit::dpi::LogicalSize::new(
+                                window.requested_width(),
+                                window.requested_height(),
+                            )
+                            .to_physical::<u32>(forced_factor);
+                        } else if approx::relative_ne!(new_factor, prior_factor) {
                             let mut scale_factor_change_events = world
                                 .get_resource_mut::<Events<WindowScaleFactorChanged>>()
                                 .unwrap();
@@ -407,17 +416,17 @@ pub fn winit_runner_with(mut app: App, mut event_loop: EventLoop<()>) {
                             });
                         }
 
-                        window.update_scale_factor_from_backend(scale_factor);
-
-                        if window.physical_width() != new_inner_size.width
-                            || window.physical_height() != new_inner_size.height
+                        let new_logical_width = new_inner_size.width as f64 / new_factor;
+                        let new_logical_height = new_inner_size.height as f64 / new_factor;
+                        if approx::relative_ne!(window.width() as f64, new_logical_width)
+                            || approx::relative_ne!(window.height() as f64, new_logical_height)
                         {
                             let mut resize_events =
                                 world.get_resource_mut::<Events<WindowResized>>().unwrap();
                             resize_events.send(WindowResized {
                                 id: window_id,
-                                width: window.width(),
-                                height: window.height(),
+                                width: new_logical_width as f32,
+                                height: new_logical_height as f32,
                             });
                         }
                         window.update_actual_size_from_backend(

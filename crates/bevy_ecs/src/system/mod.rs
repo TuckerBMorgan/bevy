@@ -1,3 +1,70 @@
+//! Tools for controlling behavior in an ECS application.
+//!
+//! Systems define how an ECS based application behaves. They have to be registered to a
+//! [`SystemStage`](crate::schedule::SystemStage) to be able to run. A system is usually
+//! written as a normal function that will be automatically converted into a system.
+//!
+//! System functions can have parameters, through which one can query and mutate Bevy ECS state.
+//! Only types that implement [`SystemParam`] can be used, automatically fetching data from
+//! the [`World`](crate::world::World).
+//!
+//! System functions often look like this:
+//!
+//! ```
+//! # use bevy_ecs::prelude::*;
+//! #
+//! # #[derive(Component)]
+//! # struct Player { alive: bool }
+//! # #[derive(Component)]
+//! # struct Score(u32);
+//! # struct Round(u32);
+//! #
+//! fn update_score_system(
+//!     mut query: Query<(&Player, &mut Score)>,
+//!     mut round: ResMut<Round>,
+//! ) {
+//!     for (player, mut score) in query.iter_mut() {
+//!         if player.alive {
+//!             score.0 += round.0;
+//!         }
+//!     }
+//!     round.0 += 1;
+//! }
+//! # update_score_system.system();
+//! ```
+//!
+//! # System ordering
+//!
+//! While the execution of systems is usually parallel and not deterministic, there are two
+//! ways to determine a certain degree of execution order:
+//!
+//! - **System Stages:** They determine hard execution synchronization boundaries inside of
+//!   which systems run in parallel by default.
+//! - **Labeling:** First, systems are labeled upon creation by calling `.label()`. Then,
+//!   methods such as `.before()` and `.after()` are appended to systems to determine
+//!   execution order in respect to other systems.
+//!
+//! # System parameter list
+//! Following is the complete list of accepted types as system parameters:
+//!
+//! - [`Query`]
+//! - [`Res`] and `Option<Res>`
+//! - [`ResMut`] and `Option<ResMut>`
+//! - [`Commands`]
+//! - [`Local`]
+//! - [`EventReader`](crate::event::EventReader)
+//! - [`EventWriter`](crate::event::EventWriter)
+//! - [`NonSend`] and `Option<NonSend>`
+//! - [`NonSendMut`] and `Option<NonSendMut>`
+//! - [`RemovedComponents`]
+//! - [`SystemChangeTick`]
+//! - [`Archetypes`](crate::archetype::Archetypes) (Provides Archetype metadata)
+//! - [`Bundles`](crate::bundle::Bundles) (Provides Bundles metadata)
+//! - [`Components`](crate::component::Components) (Provides Components metadata)
+//! - [`Entities`](crate::entity::Entities) (Provides Entities metadata)
+//! - All tuples between 1 to 16 elements where each element implements [`SystemParam`]
+//! - [`()` (unit primitive type)](https://doc.rust-lang.org/stable/std/primitive.unit.html)
+
 mod commands;
 mod exclusive_system;
 mod function_system;
@@ -20,26 +87,35 @@ mod tests {
     use std::any::TypeId;
 
     use crate::{
+        self as bevy_ecs,
         archetype::Archetypes,
         bundle::Bundles,
-        component::Components,
+        component::{Component, Components},
         entity::{Entities, Entity},
         query::{Added, Changed, Or, QueryState, With, Without},
         schedule::{Schedule, Stage, SystemStage},
         system::{
-            ConfigurableSystem, IntoExclusiveSystem, IntoSystem, Local, Query, QuerySet,
-            RemovedComponents, Res, ResMut, System, SystemState,
+            ConfigurableSystem, IntoExclusiveSystem, IntoSystem, Local, NonSend, NonSendMut, Query,
+            QuerySet, RemovedComponents, Res, ResMut, System, SystemState,
         },
         world::{FromWorld, World},
     };
 
-    #[derive(Debug, Eq, PartialEq, Default)]
+    #[derive(Component, Debug, Eq, PartialEq, Default)]
     struct A;
+    #[derive(Component)]
     struct B;
+    #[derive(Component)]
     struct C;
+    #[derive(Component)]
     struct D;
+    #[derive(Component)]
     struct E;
+    #[derive(Component)]
     struct F;
+
+    #[derive(Component)]
+    struct W<T>(T);
 
     #[test]
     fn simple_system() {
@@ -332,18 +408,60 @@ mod tests {
     }
 
     #[test]
+    fn non_send_option_system() {
+        let mut world = World::default();
+
+        world.insert_resource(false);
+        struct NotSend1(std::rc::Rc<i32>);
+        struct NotSend2(std::rc::Rc<i32>);
+        world.insert_non_send(NotSend1(std::rc::Rc::new(0)));
+
+        fn sys(
+            op: Option<NonSend<NotSend1>>,
+            mut _op2: Option<NonSendMut<NotSend2>>,
+            mut run: ResMut<bool>,
+        ) {
+            op.expect("NonSend should exist");
+            *run = true;
+        }
+
+        run_system(&mut world, sys);
+        // ensure the system actually ran
+        assert!(*world.get_resource::<bool>().unwrap());
+    }
+
+    #[test]
+    fn non_send_system() {
+        let mut world = World::default();
+
+        world.insert_resource(false);
+        struct NotSend1(std::rc::Rc<i32>);
+        struct NotSend2(std::rc::Rc<i32>);
+
+        world.insert_non_send(NotSend1(std::rc::Rc::new(1)));
+        world.insert_non_send(NotSend2(std::rc::Rc::new(2)));
+
+        fn sys(_op: NonSend<NotSend1>, mut _op2: NonSendMut<NotSend2>, mut run: ResMut<bool>) {
+            *run = true;
+        }
+
+        run_system(&mut world, sys);
+        assert!(*world.get_resource::<bool>().unwrap());
+    }
+
+    #[test]
     fn remove_tracking() {
         let mut world = World::new();
         struct Despawned(Entity);
-        let a = world.spawn().insert_bundle(("abc", 123)).id();
-        world.spawn().insert_bundle(("abc", 123));
+        let a = world.spawn().insert_bundle((W("abc"), W(123))).id();
+        world.spawn().insert_bundle((W("abc"), W(123)));
         world.insert_resource(false);
         world.insert_resource(Despawned(a));
 
         world.entity_mut(a).despawn();
 
         fn validate_removed(
-            removed_i32: RemovedComponents<i32>,
+            removed_i32: RemovedComponents<W<i32>>,
             despawned: Res<Despawned>,
             mut ran: ResMut<bool>,
         ) {
@@ -379,13 +497,13 @@ mod tests {
     fn world_collections_system() {
         let mut world = World::default();
         world.insert_resource(false);
-        world.spawn().insert_bundle((42, true));
+        world.spawn().insert_bundle((W(42), W(true)));
         fn sys(
             archetypes: &Archetypes,
             components: &Components,
             entities: &Entities,
             bundles: &Bundles,
-            query: Query<Entity, With<i32>>,
+            query: Query<Entity, With<W<i32>>>,
             mut modified: ResMut<bool>,
         ) {
             assert_eq!(query.iter().count(), 1, "entity exists");
@@ -394,7 +512,7 @@ mod tests {
                 let archetype = archetypes.get(location.archetype_id).unwrap();
                 let archetype_components = archetype.components().collect::<Vec<_>>();
                 let bundle_id = bundles
-                    .get_id(std::any::TypeId::of::<(i32, bool)>())
+                    .get_id(std::any::TypeId::of::<(W<i32>, W<bool>)>())
                     .expect("Bundle used to spawn entity should exist");
                 let bundle_info = bundles.get(bundle_id).unwrap();
                 let mut bundle_components = bundle_info.components().to_vec();
@@ -517,7 +635,7 @@ mod tests {
         #[derive(Eq, PartialEq, Debug)]
         struct A(usize);
 
-        #[derive(Eq, PartialEq, Debug)]
+        #[derive(Component, Eq, PartialEq, Debug)]
         struct B(usize);
 
         let mut world = World::default();
@@ -532,7 +650,7 @@ mod tests {
         let (a, query, _) = system_state.get(&world);
         assert_eq!(*a, A(42), "returned resource matches initial value");
         assert_eq!(
-            *query.single().unwrap(),
+            *query.single(),
             B(7),
             "returned component matches initial value"
         );
@@ -543,7 +661,7 @@ mod tests {
         #[derive(Eq, PartialEq, Debug)]
         struct A(usize);
 
-        #[derive(Eq, PartialEq, Debug)]
+        #[derive(Component, Eq, PartialEq, Debug)]
         struct B(usize);
 
         let mut world = World::default();
@@ -559,7 +677,7 @@ mod tests {
         let (a, mut query) = system_state.get_mut(&mut world);
         assert_eq!(*a, A(42), "returned resource matches initial value");
         assert_eq!(
-            *query.single_mut().unwrap(),
+            *query.single_mut(),
             B(7),
             "returned component matches initial value"
         );
@@ -567,7 +685,7 @@ mod tests {
 
     #[test]
     fn system_state_change_detection() {
-        #[derive(Eq, PartialEq, Debug)]
+        #[derive(Component, Eq, PartialEq, Debug)]
         struct A(usize);
 
         let mut world = World::default();
@@ -576,18 +694,18 @@ mod tests {
         let mut system_state: SystemState<Query<&A, Changed<A>>> = SystemState::new(&mut world);
         {
             let query = system_state.get(&world);
-            assert_eq!(*query.single().unwrap(), A(1));
+            assert_eq!(*query.single(), A(1));
         }
 
         {
             let query = system_state.get(&world);
-            assert!(query.single().is_err());
+            assert!(query.get_single().is_err());
         }
 
         world.entity_mut(entity).get_mut::<A>().unwrap().0 = 2;
         {
             let query = system_state.get(&world);
-            assert_eq!(*query.single().unwrap(), A(2));
+            assert_eq!(*query.single(), A(2));
         }
     }
 
@@ -602,10 +720,10 @@ mod tests {
 
     #[test]
     fn system_state_archetype_update() {
-        #[derive(Eq, PartialEq, Debug)]
+        #[derive(Component, Eq, PartialEq, Debug)]
         struct A(usize);
 
-        #[derive(Eq, PartialEq, Debug)]
+        #[derive(Component, Eq, PartialEq, Debug)]
         struct B(usize);
 
         let mut world = World::default();
@@ -669,8 +787,9 @@ mod tests {
     }
 }
 
-/// ```compile_fail
+/// ```compile_fail E0499
 /// use bevy_ecs::prelude::*;
+/// #[derive(Component)]
 /// struct A(usize);
 /// fn system(mut query: Query<&mut A>, e: Res<Entity>) {
 ///     let mut iter = query.iter_mut();
@@ -684,11 +803,12 @@ mod tests {
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_query_iter_lifetime_safety_test() {}
 
-/// ```compile_fail
+/// ```compile_fail E0499
 /// use bevy_ecs::prelude::*;
+/// #[derive(Component)]
 /// struct A(usize);
 /// fn system(mut query: Query<&mut A>, e: Res<Entity>) {
 ///     let mut a1 = query.get_mut(*e).unwrap();
@@ -698,11 +818,12 @@ fn system_query_iter_lifetime_safety_test() {}
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_query_get_lifetime_safety_test() {}
 
-/// ```compile_fail
+/// ```compile_fail E0499
 /// use bevy_ecs::prelude::*;
+/// #[derive(Component)]
 /// struct A(usize);
 /// fn query_set(mut queries: QuerySet<(QueryState<&mut A>, QueryState<&A>)>, e: Res<Entity>) {
 ///     let mut q2 = queries.q0();
@@ -718,11 +839,12 @@ fn system_query_get_lifetime_safety_test() {}
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_query_set_iter_lifetime_safety_test() {}
 
-/// ```compile_fail
+/// ```compile_fail E0499
 /// use bevy_ecs::prelude::*;
+/// #[derive(Component)]
 /// struct A(usize);
 /// fn query_set(mut queries: QuerySet<(QueryState<&mut A>, QueryState<&A>)>, e: Res<Entity>) {
 ///     let q1 = queries.q1();
@@ -738,11 +860,12 @@ fn system_query_set_iter_lifetime_safety_test() {}
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_query_set_iter_flip_lifetime_safety_test() {}
 
-/// ```compile_fail
+/// ```compile_fail E0499
 /// use bevy_ecs::prelude::*;
+/// #[derive(Component)]
 /// struct A(usize);
 /// fn query_set(mut queries: QuerySet<(QueryState<&mut A>, QueryState<&A>)>, e: Res<Entity>) {
 ///     let mut q2 = queries.q0();
@@ -756,11 +879,12 @@ fn system_query_set_iter_flip_lifetime_safety_test() {}
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_query_set_get_lifetime_safety_test() {}
 
-/// ```compile_fail
+/// ```compile_fail E0499
 /// use bevy_ecs::prelude::*;
+/// #[derive(Component)]
 /// struct A(usize);
 /// fn query_set(mut queries: QuerySet<(QueryState<&mut A>, QueryState<&A>)>, e: Res<Entity>) {
 ///     let q1 = queries.q1();
@@ -773,13 +897,15 @@ fn system_query_set_get_lifetime_safety_test() {}
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_query_set_get_flip_lifetime_safety_test() {}
 
-/// ```compile_fail
+/// ```compile_fail E0502
 /// use bevy_ecs::prelude::*;
 /// use bevy_ecs::system::SystemState;
+/// #[derive(Component)]
 /// struct A(usize);
+/// #[derive(Component)]
 /// struct B(usize);
 /// struct State {
 ///     state_r: SystemState<Query<'static, 'static, &'static A>>,
@@ -800,13 +926,15 @@ fn system_query_set_get_flip_lifetime_safety_test() {}
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_state_get_lifetime_safety_test() {}
 
-/// ```compile_fail
+/// ```compile_fail E0502
 /// use bevy_ecs::prelude::*;
 /// use bevy_ecs::system::SystemState;
+/// #[derive(Component)]
 /// struct A(usize);
+/// #[derive(Component)]
 /// struct B(usize);
 /// struct State {
 ///     state_r: SystemState<Query<'static, 'static, &'static A>>,
@@ -825,5 +953,5 @@ fn system_state_get_lifetime_safety_test() {}
 /// }
 /// ```
 #[allow(unused)]
-#[cfg(doc)]
+#[cfg(doctest)]
 fn system_state_iter_lifetime_safety_test() {}
